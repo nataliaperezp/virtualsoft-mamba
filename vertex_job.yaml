@@ -1,0 +1,32 @@
+displayName: mamba-training-job
+
+jobSpec:
+  workerPoolSpecs:
+    - machineSpec:
+        machineType: n1-highmem-8          # 8 vCPUs, 52 GB RAM
+        acceleratorType: NVIDIA_TESLA_T4
+        acceleratorCount: 1
+      replicaCount: 1
+      containerSpec:
+        imageUri: gcr.io/composed-arch-276322/mamba-trainer:latest
+        env:
+          # Ruta GCS donde están los parquets de secuencias
+          - name: OUT_DIR
+            value: gs://ml-bucketvs/mamba-exp/data/sequences_output
+
+          # Ruta GCS donde se guardarán los checkpoints
+          - name: GCS_CKPT_DIR
+            value: gs://ml-bucketvs/mamba-exp/checkpoints
+
+          # Proyecto W&B donde se loguean los trials
+          - name: WANDB_PROJECT
+            value: mamba-train-opt
+
+          # Ruta del JSON de UIDs dentro del contenedor (copiado en el Dockerfile)
+          - name: UIDS_PATH
+            value: /app/split_estratificado_uids.json
+
+          # W&B API KEY — reemplaza con tu key real
+          # Recomendado: usar Secret Manager en lugar de texto plano
+          - name: WANDB_API_KEY
+            value: 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
