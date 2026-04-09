@@ -1,0 +1,42 @@
+[project]
+name = "virtualsoft-mamba"
+version = "0.1.0"
+description = "Mamba SSM training job for Vertex AI"
+requires-python = ">=3.11"
+dependencies = [
+    # Core ML
+    "torch==2.4.0",
+    "mamba-ssm==2.2.2",
+    "causal-conv1d==1.4.0",
+
+    # Data
+    "polars==1.39.3",
+    "numpy==2.2.6",
+    "scikit-learn==1.7.2",
+    "pyarrow==23.0.1",
+
+    # Experiment tracking
+    "wandb==0.25.1",
+    "optuna==4.8.0",
+
+    # GCS
+    "gcsfs==2026.1.0",
+    "fsspec==2026.2.0",
+    "google-cloud-storage==3.10.1",
+
+    # Utilities
+    "psutil==5.9.3",
+    "tqdm==4.67.3",
+    "python-dotenv==1.2.2",
+]
+
+# ---------------------------------------------------------------------------
+# uv: PyTorch con soporte CUDA 11.8 (igual que en requirements.txt: cu118)
+# ---------------------------------------------------------------------------
+[tool.uv.sources]
+torch = { index = "pytorch-cu118" }
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
