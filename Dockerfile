@@ -67,6 +67,7 @@ RUN python3.11 -m pip install --no-cache-dir --no-build-isolation \
 # 3. Resto de dependencias
 # ---------------------------------------------------------------------------
 RUN uv pip install --system \
+    "transformers>=4.35,<5.0" \
     polars==1.39.3 \
     numpy==2.2.6 \
     scikit-learn==1.7.2 \
@@ -74,7 +75,7 @@ RUN uv pip install --system \
     wandb==0.25.1 \
     optuna==4.8.0 \
     gcsfs==2026.1.0 \
-    fsspec==2026.2.0 \
+    fsspec==2026.1.0 \
     google-cloud-storage==3.10.1 \
     psutil==5.9.3 \
     tqdm==4.67.3 \
@@ -86,6 +87,9 @@ RUN uv pip install --system \
 WORKDIR /app
 COPY Mamba.py .
 COPY split_estratificado_uids.json .
+# Experimento: bakeamos el .env en la imagen por simplicidad.
+# NO hacer esto en producción — los secretos quedan en las capas de la imagen.
+COPY .env .
 
 # ---------------------------------------------------------------------------
 # Entrypoint

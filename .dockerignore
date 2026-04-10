@@ -1,0 +1,58 @@
+# NOTA: .env se copia dentro de la imagen a propósito (experimento).
+# En producción, NO hacer esto — usar Secret Manager o env vars del job.
+# .env
+.env.*
+*.pem
+*.key
+credentials*.json
+service-account*.json
+
+# Git / control de versiones
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Notebooks / exploración
+*.ipynb
+.ipynb_checkpoints/
+
+# IDE / SO
+.vscode/
+.idea/
+.DS_Store
+
+# Datos y artefactos grandes (evita inflar el contexto de build)
+*.csv
+*.parquet
+*.feather
+*.pkl
+*.ckpt
+*.pt
+*.pth
+data/
+datasets/
+outputs/
+runs/
+wandb/
+mlruns/
+logs/
+*.log
+
+# Docs / config local que el runtime no necesita
+README.md
+*.md
+docs/

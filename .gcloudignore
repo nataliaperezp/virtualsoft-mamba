@@ -1,0 +1,51 @@
+# NOTA: .env sí se sube al contexto de Cloud Build a propósito (experimento).
+# En producción, NO hacer esto.
+# .env
+.env.*
+*.pem
+*.key
+credentials*.json
+service-account*.json
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# IDE / SO
+.vscode/
+.idea/
+.DS_Store
+
+# Datos y artefactos pesados — el build no los necesita
+*.csv
+*.parquet
+*.feather
+*.pkl
+*.ckpt
+*.pt
+*.pth
+data/
+datasets/
+outputs/
+runs/
+wandb/
+mlruns/
+logs/
+*.log
