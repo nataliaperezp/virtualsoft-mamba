@@ -1,37 +1,25 @@
-#!/bin/bash
-# =============================================================================
-# deploy.sh — Script de despliegue completo para Vertex AI Training Job
-# Uso: bash deploy.sh
-# =============================================================================
-set -e  # Salir si cualquier comando falla
+# #!/bin/bash
+# # =============================================================================
+# # deploy.sh — Script de despliegue completo para Vertex AI Training Job
+# # Uso: bash deploy.sh
+# # =============================================================================
+# set -e  # Salir si cualquier comando falla
 
 PROJECT_ID="composed-arch-276322"
 REGION="us-central1"
 IMAGE="gcr.io/${PROJECT_ID}/mamba-trainer:latest"
 
-echo "=============================================="
-echo "  Desplegando Mamba Training Job en Vertex AI"
-echo "=============================================="
+# echo "=============================================="
+# echo "  Desplegando Mamba Training Job en Vertex AI"
+# echo "=============================================="
 
-# ------------------------------------------------------------------------------
-# PASO 1: Autenticación
-# ------------------------------------------------------------------------------
-echo ""
-echo "▶ [1/4] Autenticando en GCP..."
-gcloud config set project "${PROJECT_ID}"
-gcloud auth configure-docker --quiet
-
-# ------------------------------------------------------------------------------
-# PASO 2: Habilitar APIs necesarias (solo la primera vez)
-# ------------------------------------------------------------------------------
-echo ""
-echo "▶ [2/4] Habilitando APIs..."
-gcloud services enable \
-    cloudbuild.googleapis.com \
-    aiplatform.googleapis.com \
-    containerregistry.googleapis.com \
-    storage.googleapis.com \
-    --quiet
+# # ------------------------------------------------------------------------------
+# # PASO 1: Autenticación
+# # ------------------------------------------------------------------------------
+# echo ""
+# echo "▶ [1/4] Autenticando en GCP..."
+# gcloud config set project "${PROJECT_ID}"
+# gcloud auth configure-docker --quiet
 
 # ------------------------------------------------------------------------------
 # PASO 3: Build y Push de la imagen con Cloud Build

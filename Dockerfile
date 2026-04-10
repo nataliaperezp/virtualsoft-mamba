@@ -14,7 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
         build-essential \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
+ENV TZ=UTC
 
 # ---------------------------------------------------------------------------
 # Fijar python3.11 como el intérprete por defecto para TODO (python, pip)
@@ -67,6 +69,7 @@ RUN python3.11 -m pip install --no-cache-dir --no-build-isolation \
 # 3. Resto de dependencias
 # ---------------------------------------------------------------------------
 RUN uv pip install --system \
+    tzdata \
     "transformers>=4.35,<5.0" \
     polars==1.39.3 \
     numpy==2.2.6 \
