@@ -9,12 +9,12 @@ steps:
       - 'build'
       - '--platform=linux/amd64'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/mamba-trainer:latest'
+      - 'gcr.io/$PROJECT_ID/mamba-trainer-contrastive:v2'
       - '.'
     timeout: '2400s'   # mamba-ssm tarda ~30 min en compilar
 
 images:
-  - 'gcr.io/$PROJECT_ID/mamba-trainer:latest'
+  - 'gcr.io/$PROJECT_ID/mamba-trainer-contrastive:v2'
 
 # Timeout total del build (40 min)
 timeout: '2400s'

@@ -21,7 +21,8 @@ storage_client = storage.Client(project=PROJECT_ID)
 bucket = storage_client.bucket(BUCKET_NAME)
 
 
-def process_batch_all_history(events_lf, batch_ids, batch_idx, m_val, s_val, N_WINDOW, STRIDE, OUT_DIR_GCS):
+def process_batch_all_history(events_lf, batch_ids, batch_idx, m_val, s_val, N_WINDOW, STRIDE, OUT_DIR_GCS,
+                              MIN_EVENTS=None, MAX_WINDOWS=None, STRIDE_THRESHOLD=3_000):
     start_time = time.perf_counter()
 
     # 1. Ajuste de IDs y Filtrado
@@ -69,13 +70,32 @@ def process_batch_all_history(events_lf, batch_ids, batch_idx, m_val, s_val, N_W
 
     # 4. Sliding Windows
     final_rows = []
+    skipped_users = 0
     for row in df_agg.iter_rows(named=True):
         u_id, e_type, p_id, n_feats = row["USER_ID"], row["EVENT_TYPE"], row["PRODUCT_ID"], row["NUM_FEATS"]
         n_events = len(e_type)
-        n_windows = max(1, (n_events - N_WINDOW) // STRIDE + 1)
 
-        for w in range(n_windows):
-            start = w * STRIDE
+        # Filtrar usuarios con muy pocos eventos (sin señal útil)
+        if MIN_EVENTS is not None and n_events < MIN_EVENTS:
+            skipped_users += 1
+            continue
+
+        # Stride adaptivo: usuarios con historial largo no necesitan overlap
+        effective_stride = N_WINDOW if n_events > STRIDE_THRESHOLD else STRIDE
+
+        if n_events <= N_WINDOW + 1:
+            starts = [0]
+        else:
+            max_start = n_events - N_WINDOW - 1
+            starts = list(range(0, max_start + 1, effective_stride))
+            if starts[-1] < max_start:
+                starts.append(max_start)
+
+        # Capear ventanas por usuario para que heavy users no dominen el dataset
+        if MAX_WINDOWS is not None:
+            starts = starts[:MAX_WINDOWS]
+
+        for start in starts:
             final_rows.append({
                 "USER_ID": u_id,
                 "INPUT_EVENT_SEQ": e_type[start: start + N_WINDOW],
@@ -83,6 +103,9 @@ def process_batch_all_history(events_lf, batch_ids, batch_idx, m_val, s_val, N_W
                 "NUM_FEATS_SEQ": n_feats[start: start + N_WINDOW],
                 "TARGET_EVENT_SEQ": e_type[start + 1: start + N_WINDOW + 1]
             })
+
+    if skipped_users:
+        print(f"   ⚠️  {skipped_users} usuarios saltados por tener menos de {MIN_EVENTS} eventos")
 
     # 5. Guardado DIRECTO AL BUCKET (Buffer en RAM)
     if final_rows:
@@ -105,31 +128,29 @@ N_WINDOW, STRIDE = 1000, 500
 GLOBAL_M_VAL, GLOBAL_S_VAL = 23.1213, 459.0598
 
 archivos_chunks = sorted([f for f in os.listdir(CHUNK_DIR) if f.endswith('.parquet')])
-print(f"📦 Total de chunks a procesar hacia GCP: {len(archivos_chunks)}")
+print(f"📦 Total de chunks encontrados: {len(archivos_chunks)}")
 
-for i, chunk_name in enumerate(archivos_chunks):
-    chunk_done_blob = bucket.blob(f"{OUT_DIR_GCS}/DONE_{chunk_name}.txt")
+# Scan global de todos los chunks para que cada usuario tenga su historial completo
+all_lf = pl.scan_parquet([os.path.join(CHUNK_DIR, c) for c in archivos_chunks])
+all_ids = all_lf.select("USER_ID").unique().collect().get_column("USER_ID").to_list()
+print(f"👥 Total de usuarios únicos: {len(all_ids):,}")
 
-    if chunk_done_blob.exists():
-        print(f"⏭️ Saltando {chunk_name}, ya existe en GCP.")
+STEP = 1000
+for j in range(0, len(all_ids), STEP):
+    label = f"b{j // STEP:05d}"
+
+    # Verificar si este batch ya fue procesado
+    done_blob = bucket.blob(f"{OUT_DIR_GCS}/DONE_{label}.txt")
+    if done_blob.exists():
+        print(f"⏭️ Saltando batch {label}, ya existe en GCP.")
         continue
 
     try:
-        lf_chunk = pl.scan_parquet(os.path.join(CHUNK_DIR, chunk_name))
-        ids = lf_chunk.select("USER_ID").unique().collect().get_column("USER_ID").to_list()
-
-        STEP = 1000
-        print(f"🔄 Procesando {chunk_name} ({len(ids)} usuarios)...")
-        for j in range(0, len(ids), STEP):
-            label = f"c{i}_b{j}"
-            process_batch_all_history(lf_chunk, ids[j:j + STEP], label,
-                                      GLOBAL_M_VAL, GLOBAL_S_VAL, N_WINDOW, STRIDE, OUT_DIR_GCS)
-
-        # Marcar como finalizado en el bucket
-        chunk_done_blob.upload_from_string("finalizado con éxito")
+        process_batch_all_history(all_lf, all_ids[j:j + STEP], label,
+                                  GLOBAL_M_VAL, GLOBAL_S_VAL, N_WINDOW, STRIDE, OUT_DIR_GCS)
+        done_blob.upload_from_string("finalizado con éxito")
         gc.collect()
-
     except Exception as e:
-        print(f"❌ Error crítico en chunk {chunk_name}: {e}")
+        print(f"❌ Error crítico en batch {label}: {e}")
 
 print(f"\n✨ ¡PROCESAMIENTO TERMINADO! Revisa gs://{BUCKET_NAME}/{OUT_DIR_GCS}/")

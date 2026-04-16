@@ -1,1 +1,14 @@
+
+.idea/misc.xml
+.idea/modules.xml
+.idea/vcs.xml
 .env
+.gitignore
+.idea/virtualsoft-mamba.iml
+.idea/inspectionProfiles/profiles_settings.xml
+.idea/inspectionProfiles/Project_Default.xml
+__pycache__/Mamba.cpython-313.pyc
+
+sequences_output/
+notebooks/
+rechunk_por_usuario.py

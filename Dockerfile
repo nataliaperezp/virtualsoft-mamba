@@ -82,13 +82,15 @@ RUN uv pip install --system \
     google-cloud-storage==3.10.1 \
     psutil==5.9.3 \
     tqdm==4.67.3 \
-    python-dotenv==1.2.2
+    python-dotenv==1.2.2 \
+    plotly==5.24.1
 
 # ---------------------------------------------------------------------------
 # Código fuente
 # ---------------------------------------------------------------------------
 WORKDIR /app
 COPY Mamba.py .
+COPY eval_contrastive_clusters.py .
 COPY split_estratificado_uids.json .
 # Experimento: bakeamos el .env en la imagen por simplicidad.
 # NO hacer esto en producción — los secretos quedan en las capas de la imagen.
