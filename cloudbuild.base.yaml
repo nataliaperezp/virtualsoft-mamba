@@ -1,0 +1,20 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--platform=linux/amd64'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/mamba-base:v1'
+      - '-f'
+      - 'Dockerfile.base'
+      - '.'
+    timeout: '2400s'
+
+images:
+  - 'gcr.io/$PROJECT_ID/mamba-base:v1'
+
+timeout: '2400s'
+
+options:
+  machineType: 'E2_HIGHCPU_32'
+  logging: CLOUD_LOGGING_ONLY

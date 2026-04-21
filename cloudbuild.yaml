@@ -3,22 +3,20 @@
 # Se ejecuta en la nube: evita problemas de compilación CUDA en Mac M-series
 # =============================================================================
 steps:
-  # Build la imagen linux/amd64 (requerido por Vertex AI)
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
       - '--platform=linux/amd64'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/mamba-trainer-contrastive:v2'
+      - 'gcr.io/$PROJECT_ID/mamba-trainer-contrastive:v3'
       - '.'
-    timeout: '2400s'   # mamba-ssm tarda ~30 min en compilar
+    timeout: '600s'
 
 images:
-  - 'gcr.io/$PROJECT_ID/mamba-trainer-contrastive:v2'
+  - 'gcr.io/$PROJECT_ID/mamba-trainer-contrastive:v3'
 
-# Timeout total del build (40 min)
-timeout: '2400s'
+timeout: '900s'
 
 options:
-  machineType: 'E2_HIGHCPU_32'   # Máquina más rápida para compilar
+  machineType: 'E2_HIGHCPU_8'
   logging: CLOUD_LOGGING_ONLY

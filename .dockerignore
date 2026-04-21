@@ -56,3 +56,5 @@ logs/
 README.md
 *.md
 docs/
+
+!model_arch.py

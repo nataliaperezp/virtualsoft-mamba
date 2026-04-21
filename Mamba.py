@@ -55,6 +55,8 @@ _parser.add_argument("--num-workers",  type=int,   default=None,
                      help="Workers del DataLoader (default: 6)")
 _parser.add_argument("--trials",       type=int,   default=None,
                      help="Número de trials de Optuna (default: 2 en prueba, 15 en prod)")
+_parser.add_argument("--use-sweep",    action="store_true", default=None,
+                     help="Usar W&B Sweep (Bayesiano) en lugar de Optuna")
 # Modo estático (sin Optuna)
 _parser.add_argument("--static",       action="store_true", default=None,
                      help="Modo estático: entrena con hiperparámetros fijos, sin Optuna")
@@ -75,6 +77,7 @@ N_EPOCHS     = _args.epochs     if _args.epochs     is not None else int(os.envi
 BATCH_SIZE   = _args.batch_size if _args.batch_size is not None else int(os.environ.get("BATCH_SIZE", "0"))
 NUM_WORKERS  = _args.num_workers if _args.num_workers is not None else int(os.environ.get("NUM_WORKERS", "6"))
 N_TRIALS     = _args.trials     if _args.trials     is not None else int(os.environ.get("N_TRIALS", "0"))
+USE_SWEEP    = _args.use_sweep  if _args.use_sweep  is not None else os.environ.get("USE_SWEEP", "False").lower() in ("true", "1", "t")
 # Modo estático
 STATIC_MODE  = _args.static     if _args.static     is not None else os.environ.get("STATIC_MODE", "False").lower() in ("true", "1", "t")
 STATIC_D_MODEL    = _args.d_model    if _args.d_model    is not None else int(os.environ.get("STATIC_D_MODEL",    "256"))
@@ -132,98 +135,7 @@ print(f"✅ Remapeo de productos: {440874} IDs posibles → {N_PRODUCTS_REMAPPED
 # CLASES
 # ---------------------------------------------------------------------------
 
-class EventTokenizer(nn.Module):
-    def __init__(self, n_event_types, n_products, d_model,
-                 use_balance=True,
-                 event_emb_dim=64, prod_emb_dim=128, num_proj_dim=64):
-        super().__init__()
-
-        self.use_balance = use_balance
-
-        # 1. Embeddings Categóricos
-        self.event_emb = nn.Embedding(n_event_types + 1, event_emb_dim, padding_idx=0)
-        self.prod_emb  = nn.Embedding(n_products + 1, prod_emb_dim, padding_idx=0)
-
-        # 2. Proyección Numérica Dinámica
-        input_num_dim = 3 if use_balance else 2
-        self.num_projection = nn.Sequential(
-            nn.Linear(input_num_dim, num_proj_dim),
-            nn.SiLU(),
-            nn.Linear(num_proj_dim, num_proj_dim)
-        )
-
-        # 3. Fusión Final
-        total_input_dim = event_emb_dim + prod_emb_dim + num_proj_dim
-        self.fusion = nn.Sequential(
-            nn.Linear(total_input_dim, d_model),
-            nn.LayerNorm(d_model),
-            nn.Dropout(0.1)
-        )
-
-    def forward(self, event_type, product_id, num_feats):
-        if not self.use_balance:
-            num_feats = num_feats[:, :, :2]
-
-        e = self.event_emb(event_type)
-        p = self.prod_emb(product_id)
-        n = self.num_projection(num_feats)
-
-        combined = torch.cat([e, p, n], dim=-1)
-        return self.fusion(combined)
-
-
-class MambaModel(nn.Module):
-    def __init__(self, n_event_types, n_products, d_model=128, d_state=32, d_conv=4,
-                 use_balance=True, event_emb_dim=64, prod_emb_dim=128, num_proj_dim=64):
-        super().__init__()
-
-        self.tokenizer = EventTokenizer(
-            n_event_types=n_event_types,
-            n_products=n_products,
-            d_model=d_model,
-            use_balance=use_balance,
-            event_emb_dim=event_emb_dim,
-            prod_emb_dim=prod_emb_dim,
-            num_proj_dim=num_proj_dim
-        )
-
-        self.backbone = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=2,
-        )
-
-        self.head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_model, n_event_types + 1),
-        )
-
-        self.contrastive_proj = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, d_model)
-        )
-
-    def forward(self, event_type, product_id, num_feats, return_embeddings=False):
-        x = self.tokenizer(event_type, product_id, num_feats)
-        h = self.backbone(x)
-        logits = self.head(h)
-
-        if return_embeddings:
-            user_emb = F.normalize(self.contrastive_proj(h[:, -1, :]), dim=-1)
-            return logits, user_emb
-
-        return logits
-
-    def get_user_embedding(self, event_type, product_id, num_feats):
-        self.eval()
-        with torch.no_grad():
-            x = self.tokenizer(event_type, product_id, num_feats)
-            h = self.backbone(x)
-            return F.normalize(h[:, -1, :], dim=-1)
+from model_arch import EventTokenizer, MambaModel  # noqa: E402
 
 
 class FastSequenceDataset(Dataset):
@@ -458,12 +370,282 @@ def upload_checkpoint_to_gcs(local_path: str, gcs_filename: str):
 
 
 # ---------------------------------------------------------------------------
-# MEJOR MODELO GLOBAL (entre todos los trials)
+# MEJOR MODELO GLOBAL (entre todos los runs/trials)
 # ---------------------------------------------------------------------------
 best_overall_recall = -1.0
 
 # ---------------------------------------------------------------------------
-# FUNCIÓN OBJETIVO OPTUNA
+# NÚCLEO DE ENTRENAMIENTO (compartido por Optuna, W&B Sweep y modo estático)
+# on_epoch_end(metric, epoch) -> bool  — devuelve True para detener temprano
+# ---------------------------------------------------------------------------
+def _run_training(config, run, on_epoch_end=None):
+    global best_overall_recall
+
+    model     = MambaModel(
+        n_products=N_PRODUCTS, n_event_types=21,
+        d_model=config["d_model"], d_state=config["d_state"],
+        use_balance=USAR_BALANCE
+    ).to(device)
+    optimizer     = torch.optim.AdamW(model.parameters(), lr=config["lr"])
+    scaler        = torch.cuda.amp.GradScaler()
+    early_stopper = EarlyStopping(patience=5)
+    best_score    = -1.0
+
+    for epoch in range(config["epochs"]):
+        epoch_start = time.time()
+        print(f"\n  ► Epoch {epoch + 1}/{config['epochs']} | {len(train_groups)} grupos de entrenamiento...")
+
+        # ── ENTRENAMIENTO ──────────────────────────────────────────────────
+        model.train()
+        train_loss_accum = 0.0
+        grad_norm_accum  = 0.0
+        n_batches        = 0
+
+        for g_idx, group in enumerate(train_groups):
+            torch.cuda.empty_cache()
+            loader = get_dataloader_for_multiple_files(
+                group, train_uids, batch_size=config["batch_size"], task=task, num_workers=NUM_WORKERS
+            )
+            if loader is None:
+                continue
+
+            for batch in loader:
+                optimizer.zero_grad()
+                et     = batch["event_type"].to(device)
+                pid    = batch["product_id"].to(device)
+                nf     = batch["num_feats"].to(device)
+                target = batch["target"].to(device)
+
+                with torch.cuda.amp.autocast():
+                    logits, emb1_raw = model(et, pid, nf, return_embeddings=True)
+                    min_seq    = min(logits.shape[1], target.shape[1])
+                    loss_total = 0.0
+
+                    if task in ["next_action", "both"]:
+                        loss_total += criterion(
+                            logits[:, :min_seq, :].reshape(-1, logits.size(-1)),
+                            target[:, :min_seq].reshape(-1)
+                        )
+                    if task in ["contrastive", "both"]:
+                        et_v2       = apply_event_masking(et, mask_prob=0.4)
+                        _, emb2_raw = model(et_v2, pid, nf, return_embeddings=True)
+                        emb1, emb2 = emb1_raw, emb2_raw
+                        loss_cl     = compute_contrastive_loss(emb1, emb2, temp=config["temp"])
+                        loss_total += (config["lambda_cl"] * loss_cl) if task == "both" else loss_cl
+
+                scaler.scale(loss_total).backward()
+                scaler.unscale_(optimizer)
+                grad_norm        = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                train_loss_accum += loss_total.item()
+                grad_norm_accum  += grad_norm.item()
+                n_batches        += 1
+
+            del loader
+            gc.collect()
+
+            ckpt_steps = max(1, len(train_groups) // 4)
+            if (g_idx + 1) % ckpt_steps == 0 or (g_idx + 1) == len(train_groups):
+                print(f"    Grupo {g_idx + 1}/{len(train_groups)} | Loss: {train_loss_accum / max(n_batches, 1):.4f}")
+
+        avg_train_loss = train_loss_accum / max(n_batches, 1)
+        avg_grad_norm  = grad_norm_accum  / max(n_batches, 1)
+
+        # ── VALIDACIÓN ─────────────────────────────────────────────────────
+        model.eval()
+        ram_usage      = psutil.Process().memory_info().rss / (1024 ** 3)
+        gpu_usage      = torch.cuda.memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
+        epoch_duration = time.time() - epoch_start
+
+        if task == "contrastive":
+            val_cl_loss_accum = 0.0
+            n_val_batches     = 0
+            all_cosine_sims   = []
+
+            with torch.no_grad():
+                for v_group in val_groups:
+                    loader_val = get_dataloader_for_multiple_files(
+                        v_group, test_uids, batch_size=config["batch_size"], task=task, num_workers=NUM_WORKERS
+                    )
+                    if loader_val is None:
+                        continue
+                    for batch in loader_val:
+                        et  = batch["event_type"].to(device)
+                        pid = batch["product_id"].to(device)
+                        nf  = batch["num_feats"].to(device)
+
+                        with torch.cuda.amp.autocast():
+                            emb1    = model.get_user_embedding(et, pid, nf)
+                            et_v2   = apply_event_masking(et, mask_prob=0.15)
+                            emb2    = model.get_user_embedding(et_v2, pid, nf)
+                            cl_loss = compute_contrastive_loss(emb1, emb2, temp=config["temp"])
+
+                        val_cl_loss_accum += cl_loss.item()
+                        n_val_batches     += 1
+                        # similitud coseno de pares positivos (embeddings ya normalizados)
+                        all_cosine_sims.extend((emb1 * emb2).sum(dim=-1).cpu().tolist())
+                    del loader_val
+
+            val_cl_loss   = val_cl_loss_accum / max(n_val_batches, 1)
+            current_score = -val_cl_loss
+            f1_m = r_macro = p_macro = f1_weighted = r_weighted = p_weighted = 0.0
+
+            print(
+                f"{run.name} | Epoch {epoch + 1}/{config['epochs']} | "
+                f"Val CL Loss: {val_cl_loss:.4f} | "
+                f"RAM: {ram_usage:.2f} GB | GPU: {gpu_usage:.2f} GB | {epoch_duration:.1f}s"
+            )
+
+            log_dict = {
+                "epoch":                    epoch + 1,
+                "train_loss":               avg_train_loss,
+                "grad_norm":                avg_grad_norm,
+                "val_cl_loss":              val_cl_loss,
+                "pos_pair_cosine_sim_mean": float(np.mean(all_cosine_sims)) if all_cosine_sims else 0.0,
+                "ram_gb":                   ram_usage,
+                "gpu_gb":                   gpu_usage,
+                "epoch_duration_sec":       epoch_duration,
+            }
+            if all_cosine_sims:
+                log_dict["pos_pair_cosine_sim"] = wandb.Histogram(all_cosine_sims)
+
+        else:
+            all_preds, all_targets = [], []
+
+            with torch.no_grad():
+                for v_group in val_groups:
+                    loader_val = get_dataloader_for_multiple_files(
+                        v_group, test_uids, batch_size=config["batch_size"], task=task, num_workers=NUM_WORKERS
+                    )
+                    if loader_val is None:
+                        continue
+                    for batch in loader_val:
+                        et     = batch["event_type"].to(device)
+                        pid    = batch["product_id"].to(device)
+                        nf     = batch["num_feats"].to(device)
+                        target = batch["target"].to(device)
+
+                        with torch.cuda.amp.autocast():
+                            logits = model(et, pid, nf)
+                        preds  = torch.argmax(logits, dim=-1)
+                        min_v  = min(preds.shape[1], target.shape[1])
+                        mask   = (target[:, :min_v] != 0)
+                        all_targets.append(target[:, :min_v][mask].cpu())
+                        all_preds.append(preds[:, :min_v][mask].cpu())
+                    del loader_val
+
+            y_true = torch.cat(all_targets).numpy()
+            y_pred = torch.cat(all_preds).numpy()
+
+            p_macro,    r_macro,    f1_m,        _ = precision_recall_fscore_support(y_true, y_pred, average='macro',    zero_division=0)
+            p_weighted, r_weighted, f1_weighted, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted', zero_division=0)
+            current_score = r_macro
+
+            # Tabla por clase
+            report_dict = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+            class_rows  = [
+                [lbl, v["precision"], v["recall"], v["f1-score"], int(v["support"])]
+                for lbl, v in report_dict.items()
+                if lbl not in ("accuracy", "macro avg", "weighted avg")
+            ]
+            print(
+                f"{run.name} | Epoch {epoch + 1}/{config['epochs']} | "
+                f"F1 Macro: {f1_m:.4f} | Recall Macro: {r_macro:.4f} | Precision Macro: {p_macro:.4f} | "
+                f"RAM: {ram_usage:.2f} GB | GPU: {gpu_usage:.2f} GB | {epoch_duration:.1f}s"
+            )
+            print(classification_report(y_true, y_pred, zero_division=0))
+
+            log_dict = {
+                "epoch":                  epoch + 1,
+                "train_loss":             avg_train_loss,
+                "grad_norm":              avg_grad_norm,
+                "val_recall_macro":       r_macro,
+                "val_recall_weighted":    r_weighted,
+                "val_precision_macro":    p_macro,
+                "val_precision_weighted": p_weighted,
+                "val_f1_macro":           f1_m,
+                "val_f1_weighted":        f1_weighted,
+                "per_class_metrics":      wandb.Table(
+                    columns=["class", "precision", "recall", "f1", "support"],
+                    data=class_rows
+                ),
+                "ram_gb":                 ram_usage,
+                "gpu_gb":                 gpu_usage,
+                "epoch_duration_sec":     epoch_duration,
+            }
+
+        wandb.log(log_dict)
+
+        # Checkpoint si mejoró
+        if current_score > best_score:
+            best_score = current_score
+
+            # Incluir el código fuente de las clases para inferencia sin model_arch.py
+            _arch_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_arch.py")
+            with open(_arch_path, "r") as _f:
+                _model_arch_source = _f.read()
+
+            checkpoint_payload = {
+                "state_dict": model.state_dict(),        # ← pesos
+                "config_arch": {                          # ← parámetros del constructor
+                    "n_products":    N_PRODUCTS,
+                    "n_event_types": 21,
+                    "d_model":       config["d_model"],
+                    "d_state":       config["d_state"],
+                    "use_balance":   USAR_BALANCE,
+                },
+                "config":            config,    
+                "product_id_map":    product_id_map,
+                "model_arch_source": _model_arch_source,
+                "metric":             current_score,
+                "metric_name":        "neg_val_cl_loss" if task == "contrastive" else "recall_macro",
+                "recall_macro":       r_macro,
+                "recall_weighted":    r_weighted,
+                "precision_macro":    p_macro,
+                "precision_weighted": p_weighted,
+                "f1_macro":           f1_m,
+                "f1_weighted":        f1_weighted,
+                "experiment": {
+                    "exp":          EXP,
+                    "task":         task,
+                    "usar_balance": USAR_BALANCE,
+                    "run":          run.name,
+                    "epoch":        epoch + 1,
+                }
+            }
+            local_ckpt = f"/tmp/best_model_{run.name}.ckpt"
+            torch.save(checkpoint_payload, local_ckpt)
+            upload_checkpoint_to_gcs(local_ckpt, f"best_model_{run.name}.ckpt")
+
+            if current_score > best_overall_recall:
+                best_overall_recall = current_score
+                local_overall = "/tmp/best_model_overall.ckpt"
+                torch.save(checkpoint_payload, local_overall)
+                upload_checkpoint_to_gcs(local_overall, "best_model_overall.ckpt")
+                print(f"🏆 Nuevo mejor modelo global: score={current_score:.4f} (run {run.name}, epoch {epoch + 1})")
+
+        report_metric = current_score
+
+        # Callback por epoch (usado por Optuna para pruning)
+        if on_epoch_end is not None and on_epoch_end(report_metric, epoch):
+            print(f"  Pruning signal recibido en epoch {epoch + 1}")
+            break
+
+        early_stopper(report_metric)
+        if early_stopper.early_stop:
+            print(f"Early stopping en epoch {epoch + 1}")
+            break
+
+    del model, optimizer
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    return best_score
+
+
+# ---------------------------------------------------------------------------
+# WRAPPER OPTUNA
 # ---------------------------------------------------------------------------
 def objective(trial):
     config = {
@@ -490,266 +672,59 @@ def objective(trial):
         f"\n{'='*60}"
     )
 
-    model_t = MambaModel(
-        n_products=N_PRODUCTS,
-        n_event_types=21,
-        d_model=config["d_model"],
-        d_state=config["d_state"],
-        use_balance=USAR_BALANCE
-    ).to(device)
+    pruned = [False]
 
-    global best_overall_recall
-
-    optimizer_t    = torch.optim.AdamW(model_t.parameters(), lr=config["lr"])
-    scaler         = torch.cuda.amp.GradScaler()
-    early_stopper  = EarlyStopping(patience=3)
-    best_trial_f1  = -1.0
-
-    for epoch in range(config["epochs"]):
-        epoch_start_time = time.time()
-        print(f"\n  ► Epoch {epoch + 1}/{config['epochs']} | {len(train_groups)} grupos de entrenamiento...")
-
-        # A. FASE ENTRENAMIENTO
-        model_t.train()
-        train_loss_accum = 0
-
-        for g_idx, group in enumerate(train_groups):
-            torch.cuda.empty_cache()
-
-            loader = get_dataloader_for_multiple_files(
-                group, train_uids, batch_size=config["batch_size"], task=task, num_workers=NUM_WORKERS
-            )
-            if loader is None:
-                continue
-
-            for batch in loader:
-                optimizer_t.zero_grad()
-                et     = batch["event_type"].to(device)
-                pid    = batch["product_id"].to(device)
-                nf     = batch["num_feats"].to(device)
-                target = batch["target"].to(device)
-
-                with torch.cuda.amp.autocast():
-                    logits, emb1_raw = model_t(et, pid, nf, return_embeddings=True)
-                    min_seq  = min(logits.shape[1], target.shape[1])
-
-                    loss_total = 0.0
-
-                    if task in ["next_action", "both"]:
-                        loss_na = criterion(
-                            logits[:, :min_seq, :].reshape(-1, logits.size(-1)),
-                            target[:, :min_seq].reshape(-1)
-                        )
-                        loss_total += loss_na
-
-                    if task in ["contrastive", "both"]:
-                        et_v2       = apply_event_masking(et, mask_prob=0.15)
-                        _, emb2_raw = model_t(et_v2, pid, nf, return_embeddings=True)
-                        emb1, emb2  = get_pooled_embedding(emb1_raw), get_pooled_embedding(emb2_raw)
-                        loss_cl     = compute_contrastive_loss(emb1, emb2, temp=config["temp"])
-
-                        if task == "both":
-                            loss_total += (config["lambda_cl"] * loss_cl)
-                        else:
-                            loss_total += loss_cl
-
-                scaler.scale(loss_total).backward()
-                scaler.unscale_(optimizer_t)
-                torch.nn.utils.clip_grad_norm_(model_t.parameters(), max_norm=1.0)
-                scaler.step(optimizer_t)
-                scaler.update()
-                train_loss_accum += loss_total.item()
-
-            del loader
-            gc.collect()
-
-            # Log de progreso cada 25% de grupos
-            checkpoint_steps = max(1, len(train_groups) // 4)
-            if (g_idx + 1) % checkpoint_steps == 0 or (g_idx + 1) == len(train_groups):
-                avg_loss_so_far = train_loss_accum / (g_idx + 1)
-                print(
-                    f"    Grupo {g_idx + 1}/{len(train_groups)} "
-                    f"| Loss promedio: {avg_loss_so_far:.4f}"
-                )
-
-        # B. FASE VALIDACIÓN
-        model_t.eval()
-        ram_usage      = psutil.Process().memory_info().rss / (1024 ** 3)
-        gpu_usage      = torch.cuda.memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
-        epoch_duration = time.time() - epoch_start_time
-
-        if task == "contrastive":
-            # Para contrastivo: evaluar con loss contrastivo en val (sin gradientes)
-            val_cl_loss_accum = 0.0
-            n_val_batches     = 0
-
-            with torch.no_grad():
-                for v_group in val_groups:
-                    loader_val = get_dataloader_for_multiple_files(
-                        v_group, test_uids, batch_size=config["batch_size"], task=task, num_workers=NUM_WORKERS
-                    )
-                    if loader_val is None:
-                        continue
-                    for batch in loader_val:
-                        et  = batch["event_type"].to(device)
-                        pid = batch["product_id"].to(device)
-                        nf  = batch["num_feats"].to(device)
-
-                        with torch.cuda.amp.autocast():
-                            _, emb1_raw = model_t(et, pid, nf, return_embeddings=True)
-                            et_v2       = apply_event_masking(et, mask_prob=0.15)
-                            _, emb2_raw = model_t(et_v2, pid, nf, return_embeddings=True)
-                            emb1        = get_pooled_embedding(emb1_raw)
-                            emb2        = get_pooled_embedding(emb2_raw)
-                            cl_loss     = compute_contrastive_loss(emb1, emb2, temp=config["temp"])
-
-                        val_cl_loss_accum += cl_loss.item()
-                        n_val_batches     += 1
-                    del loader_val
-
-            val_cl_loss   = val_cl_loss_accum / max(n_val_batches, 1)
-            # Optuna maximiza → negamos el loss (menor loss = mejor embedding)
-            current_score = -val_cl_loss
-            f1_m = r_macro = p_macro = f1_weighted = r_weighted = p_weighted = 0.0
-
-            print(
-                f"Trial {trial.number} | Epoch {epoch + 1}/{config['epochs']} | "
-                f"Val CL Loss: {val_cl_loss:.4f} | "
-                f"RAM: {ram_usage:.2f} GB | GPU: {gpu_usage:.2f} GB | "
-                f"Tiempo: {epoch_duration:.1f}s"
-            )
-
-            wandb.log({
-                "epoch":              epoch + 1,
-                "train_loss":         train_loss_accum / max(len(train_groups), 1),
-                "val_cl_loss":        val_cl_loss,
-                "ram_gb":             ram_usage,
-                "gpu_gb":             gpu_usage,
-                "epoch_duration_sec": epoch_duration
-            })
-
-        else:
-            # Para next_action y both: métricas de clasificación
-            all_preds, all_targets = [], []
-
-            with torch.no_grad():
-                for v_group in val_groups:
-                    loader_val = get_dataloader_for_multiple_files(
-                        v_group, test_uids, batch_size=config["batch_size"], task=task, num_workers=NUM_WORKERS
-                    )
-                    if loader_val is None:
-                        continue
-                    for batch in loader_val:
-                        et     = batch["event_type"].to(device)
-                        pid    = batch["product_id"].to(device)
-                        nf     = batch["num_feats"].to(device)
-                        target = batch["target"].to(device)
-
-                        with torch.cuda.amp.autocast():
-                            logits = model_t(et, pid, nf)
-                        preds  = torch.argmax(logits, dim=-1)
-
-                        min_v = min(preds.shape[1], target.shape[1])
-                        mask  = (target[:, :min_v] != 0)
-                        all_targets.append(target[:, :min_v][mask].cpu())
-                        all_preds.append(preds[:, :min_v][mask].cpu())
-                    del loader_val
-
-            y_true = torch.cat(all_targets).numpy()
-            y_pred = torch.cat(all_preds).numpy()
-
-            metrics_macro    = precision_recall_fscore_support(y_true, y_pred, average='macro',    zero_division=0)
-            metrics_weighted = precision_recall_fscore_support(y_true, y_pred, average='weighted', zero_division=0)
-
-            p_macro,    r_macro,    f1_m,        _ = metrics_macro
-            p_weighted, r_weighted, f1_weighted, _ = metrics_weighted
-            current_score = r_macro
-
-            print(
-                f"Trial {trial.number} | Epoch {epoch + 1}/{config['epochs']} | "
-                f"F1 Macro: {f1_m:.4f} | Recall Macro: {r_macro:.4f} | Precision Macro: {p_macro:.4f} | "
-                f"RAM: {ram_usage:.2f} GB | GPU: {gpu_usage:.2f} GB | "
-                f"Tiempo: {epoch_duration:.1f}s"
-            )
-            print(classification_report(y_true, y_pred, zero_division=0))
-
-            wandb.log({
-                "epoch":                  epoch + 1,
-                "train_loss":             train_loss_accum / max(len(train_groups), 1),
-                "val_recall_macro":       r_macro,
-                "val_recall_weighted":    r_weighted,
-                "val_precision_macro":    p_macro,
-                "val_precision_weighted": p_weighted,
-                "val_f1_macro":           f1_m,
-                "val_f1_weighted":        f1_weighted,
-                "ram_gb":                 ram_usage,
-                "gpu_gb":                 gpu_usage,
-                "epoch_duration_sec":     epoch_duration
-            })
-
-        if current_score > best_trial_f1:
-            best_trial_f1 = current_score
-            checkpoint_payload = {
-                "model":              model_t,
-                "config":             config,
-                "product_id_map":     product_id_map,
-                "metric":             current_score,
-                "metric_name":        "neg_val_cl_loss" if task == "contrastive" else "recall_macro",
-                "recall_macro":       r_macro,
-                "recall_weighted":    r_weighted,
-                "precision_macro":    p_macro,
-                "precision_weighted": p_weighted,
-                "f1_macro":           f1_m,
-                "f1_weighted":        f1_weighted,
-                "experiment": {
-                    "exp":          EXP,
-                    "task":         task,
-                    "usar_balance": USAR_BALANCE,
-                    "trial":        trial.number,
-                    "epoch":        epoch + 1,
-                }
-            }
-
-            # Mejor modelo del trial
-            local_ckpt = f"/tmp/best_model_trial_{trial.number}.ckpt"
-            torch.save(checkpoint_payload, local_ckpt)
-            upload_checkpoint_to_gcs(local_ckpt, f"best_model_trial_{trial.number}.ckpt")
-
-            # Mejor modelo global entre todos los trials
-            if current_score > best_overall_recall:
-                best_overall_recall = current_score
-                local_overall = "/tmp/best_model_overall.ckpt"
-                torch.save(checkpoint_payload, local_overall)
-                upload_checkpoint_to_gcs(local_overall, "best_model_overall.ckpt")
-                print(f"🏆 Nuevo mejor modelo global: recall_macro={current_score:.4f} (trial {trial.number}, epoch {epoch + 1})")
-
-        # Usar la métrica correcta según el task
-        report_metric = current_score if task == "contrastive" else f1_m
-        trial.report(report_metric, epoch)
+    def on_epoch_end(metric, epoch):
+        trial.report(metric, epoch)
         if trial.should_prune():
-            run.finish()
-            raise optuna.exceptions.TrialPruned()
+            pruned[0] = True
+            return True
+        return False
 
-        early_stopper(report_metric)
-        if early_stopper.early_stop:
-            print(f"Early stopping en epoch {epoch + 1}")
-            break
-
+    best_score = _run_training(config, run, on_epoch_end=on_epoch_end)
     run.finish()
-    del model_t, optimizer_t
-    torch.cuda.empty_cache()
-    gc.collect()
 
-    return best_trial_f1
+    if pruned[0]:
+        raise optuna.exceptions.TrialPruned()
+
+    return best_score
 
 
 # ---------------------------------------------------------------------------
-# ENTRENAMIENTO ESTÁTICO (sin Optuna)
+# WRAPPER W&B SWEEP
+# ---------------------------------------------------------------------------
+def train_one_trial():
+    run = wandb.init()
+    wc  = wandb.config
+
+    n_epochs = N_EPOCHS if N_EPOCHS > 0 else (2 if TEST_MODE else 10)
+    config = {
+        "d_model":    wc.d_model,
+        "d_state":    wc.d_state,
+        "lambda_cl":  wc.lambda_cl,
+        "lr":         wc.lr,
+        "temp":       wc.temp,
+        "batch_size": batch_size,
+        "epochs":     n_epochs,
+    }
+    wandb.config.update({"batch_size": batch_size, "epochs": n_epochs}, allow_val_change=True)
+
+    print(
+        f"\n{'='*60}\n"
+        f"  Sweep {run.name} | d_model={config['d_model']} | d_state={config['d_state']} "
+        f"| lr={config['lr']:.2e} | lambda_cl={config['lambda_cl']:.2f} | temp={config['temp']:.2f}"
+        f"\n{'='*60}"
+    )
+
+    _run_training(config, run)
+    run.finish()
+
+
+# ---------------------------------------------------------------------------
+# ENTRENAMIENTO ESTÁTICO (sin optimización de hiperparámetros)
 # ---------------------------------------------------------------------------
 def train_static():
-    """Entrena con hiperparámetros fijos — sin optimización Optuna."""
     n_epochs = N_EPOCHS if N_EPOCHS > 0 else (2 if TEST_MODE else 10)
-
     config = {
         "d_model":    STATIC_D_MODEL,
         "d_state":    STATIC_D_STATE,
@@ -759,204 +734,82 @@ def train_static():
         "batch_size": batch_size,
         "epochs":     n_epochs,
     }
-
     print(
         f"\n{'='*60}\n"
         f"  MODO ESTÁTICO | d_model={config['d_model']} | d_state={config['d_state']} "
         f"| lr={config['lr']:.2e} | lambda_cl={config['lambda_cl']:.2f} | temp={config['temp']:.2f}"
         f"\n{'='*60}"
     )
-
     run = wandb.init(
         project=f"{WANDB_PROJECT}-{EXP}-{task}-{USAR_BALANCE}",
         name="static-run",
         config=config,
         reinit=True
     )
-
-    model_s       = MambaModel(
-        n_products=N_PRODUCTS, n_event_types=21,
-        d_model=config["d_model"], d_state=config["d_state"],
-        use_balance=USAR_BALANCE
-    ).to(device)
-    optimizer_s   = torch.optim.AdamW(model_s.parameters(), lr=config["lr"])
-    scaler        = torch.cuda.amp.GradScaler()
-    early_stopper = EarlyStopping(patience=3)
-    best_score    = -1.0
-
-    for epoch in range(config["epochs"]):
-        epoch_start_time = time.time()
-        print(f"\n  ► Epoch {epoch + 1}/{config['epochs']} | {len(train_groups)} grupos de entrenamiento...")
-
-        # A. FASE ENTRENAMIENTO
-        model_s.train()
-        train_loss_accum = 0
-
-        for g_idx, group in enumerate(train_groups):
-            torch.cuda.empty_cache()
-            loader = get_dataloader_for_multiple_files(
-                group, train_uids, batch_size=config["batch_size"], task=task, num_workers=NUM_WORKERS
-            )
-            if loader is None:
-                continue
-
-            for batch in loader:
-                optimizer_s.zero_grad()
-                et     = batch["event_type"].to(device)
-                pid    = batch["product_id"].to(device)
-                nf     = batch["num_feats"].to(device)
-                target = batch["target"].to(device)
-
-                with torch.cuda.amp.autocast():
-                    logits, emb1_raw = model_s(et, pid, nf, return_embeddings=True)
-                    min_seq  = min(logits.shape[1], target.shape[1])
-                    loss_total = 0.0
-
-                    if task in ["next_action", "both"]:
-                        loss_total += criterion(
-                            logits[:, :min_seq, :].reshape(-1, logits.size(-1)),
-                            target[:, :min_seq].reshape(-1)
-                        )
-                    if task in ["contrastive", "both"]:
-                        et_v2       = apply_event_masking(et, mask_prob=0.15)
-                        _, emb2_raw = model_s(et_v2, pid, nf, return_embeddings=True)
-                        emb1, emb2  = get_pooled_embedding(emb1_raw), get_pooled_embedding(emb2_raw)
-                        loss_cl     = compute_contrastive_loss(emb1, emb2, temp=config["temp"])
-                        loss_total += (config["lambda_cl"] * loss_cl) if task == "both" else loss_cl
-
-                scaler.scale(loss_total).backward()
-                scaler.unscale_(optimizer_s)
-                torch.nn.utils.clip_grad_norm_(model_s.parameters(), max_norm=1.0)
-                scaler.step(optimizer_s)
-                scaler.update()
-                train_loss_accum += loss_total.item()
-
-            del loader
-            gc.collect()
-
-            checkpoint_steps = max(1, len(train_groups) // 4)
-            if (g_idx + 1) % checkpoint_steps == 0 or (g_idx + 1) == len(train_groups):
-                print(f"    Grupo {g_idx + 1}/{len(train_groups)} | Loss promedio: {train_loss_accum / (g_idx + 1):.4f}")
-
-        # B. FASE VALIDACIÓN
-        model_s.eval()
-        ram_usage      = psutil.Process().memory_info().rss / (1024 ** 3)
-        gpu_usage      = torch.cuda.memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
-        epoch_duration = time.time() - epoch_start_time
-
-        if task == "contrastive":
-            val_cl_loss_accum, n_val_batches = 0.0, 0
-            with torch.no_grad():
-                for v_group in val_groups:
-                    loader_val = get_dataloader_for_multiple_files(
-                        v_group, test_uids, batch_size=config["batch_size"], task=task, num_workers=NUM_WORKERS
-                    )
-                    if loader_val is None:
-                        continue
-                    for batch in loader_val:
-                        et, pid, nf = batch["event_type"].to(device), batch["product_id"].to(device), batch["num_feats"].to(device)
-                        with torch.cuda.amp.autocast():
-                            _, emb1_raw = model_s(et, pid, nf, return_embeddings=True)
-                            et_v2       = apply_event_masking(et, mask_prob=0.15)
-                            _, emb2_raw = model_s(et_v2, pid, nf, return_embeddings=True)
-                            cl_loss     = compute_contrastive_loss(get_pooled_embedding(emb1_raw), get_pooled_embedding(emb2_raw), temp=config["temp"])
-                        val_cl_loss_accum += cl_loss.item()
-                        n_val_batches     += 1
-                    del loader_val
-
-            val_cl_loss   = val_cl_loss_accum / max(n_val_batches, 1)
-            current_score = -val_cl_loss
-            f1_m = r_macro = p_macro = f1_weighted = r_weighted = p_weighted = 0.0
-            print(f"Static | Epoch {epoch + 1}/{config['epochs']} | Val CL Loss: {val_cl_loss:.4f} | RAM: {ram_usage:.2f} GB | GPU: {gpu_usage:.2f} GB | Tiempo: {epoch_duration:.1f}s")
-            wandb.log({"epoch": epoch + 1, "train_loss": train_loss_accum / max(len(train_groups), 1),
-                       "val_cl_loss": val_cl_loss, "ram_gb": ram_usage, "gpu_gb": gpu_usage, "epoch_duration_sec": epoch_duration})
-        else:
-            all_preds, all_targets = [], []
-            with torch.no_grad():
-                for v_group in val_groups:
-                    loader_val = get_dataloader_for_multiple_files(
-                        v_group, test_uids, batch_size=config["batch_size"], task=task, num_workers=NUM_WORKERS
-                    )
-                    if loader_val is None:
-                        continue
-                    for batch in loader_val:
-                        et, pid, nf, target = batch["event_type"].to(device), batch["product_id"].to(device), batch["num_feats"].to(device), batch["target"].to(device)
-                        with torch.cuda.amp.autocast():
-                            logits = model_s(et, pid, nf)
-                        preds = torch.argmax(logits, dim=-1)
-                        min_v = min(preds.shape[1], target.shape[1])
-                        mask  = (target[:, :min_v] != 0)
-                        all_targets.append(target[:, :min_v][mask].cpu())
-                        all_preds.append(preds[:, :min_v][mask].cpu())
-                    del loader_val
-
-            y_true = torch.cat(all_targets).numpy()
-            y_pred = torch.cat(all_preds).numpy()
-            p_macro,    r_macro,    f1_m,        _ = precision_recall_fscore_support(y_true, y_pred, average='macro',    zero_division=0)
-            p_weighted, r_weighted, f1_weighted, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted', zero_division=0)
-            current_score = r_macro
-            print(f"Static | Epoch {epoch + 1}/{config['epochs']} | F1 Macro: {f1_m:.4f} | Recall Macro: {r_macro:.4f} | Precision Macro: {p_macro:.4f} | RAM: {ram_usage:.2f} GB | GPU: {gpu_usage:.2f} GB | Tiempo: {epoch_duration:.1f}s")
-            print(classification_report(y_true, y_pred, zero_division=0))
-            wandb.log({"epoch": epoch + 1, "train_loss": train_loss_accum / max(len(train_groups), 1),
-                       "val_recall_macro": r_macro, "val_recall_weighted": r_weighted,
-                       "val_precision_macro": p_macro, "val_precision_weighted": p_weighted,
-                       "val_f1_macro": f1_m, "val_f1_weighted": f1_weighted,
-                       "ram_gb": ram_usage, "gpu_gb": gpu_usage, "epoch_duration_sec": epoch_duration})
-
-        if current_score > best_score:
-            best_score = current_score
-            checkpoint_payload = {
-                "model":              model_s,
-                "config":             config,
-                "product_id_map":     product_id_map,
-                "metric":             current_score,
-                "metric_name":        "neg_val_cl_loss" if task == "contrastive" else "recall_macro",
-                "recall_macro":       r_macro,
-                "recall_weighted":    r_weighted,
-                "precision_macro":    p_macro,
-                "precision_weighted": p_weighted,
-                "f1_macro":           f1_m,
-                "f1_weighted":        f1_weighted,
-                "experiment": {"exp": EXP, "task": task, "usar_balance": USAR_BALANCE, "trial": "static", "epoch": epoch + 1}
-            }
-            local_ckpt = "/tmp/best_model_static.ckpt"
-            torch.save(checkpoint_payload, local_ckpt)
-            upload_checkpoint_to_gcs(local_ckpt, "best_model_static.ckpt")
-
-        early_stopper(current_score if task == "contrastive" else f1_m)
-        if early_stopper.early_stop:
-            print(f"Early stopping en epoch {epoch + 1}")
-            break
-
+    best_score = _run_training(config, run)
     run.finish()
-    del model_s, optimizer_s
-    torch.cuda.empty_cache()
-    gc.collect()
     print(f"\n✅ Entrenamiento estático finalizado | Mejor score: {best_score:.4f}")
     return best_score
 
 
 # ---------------------------------------------------------------------------
-# EJECUCIÓN DEL ESTUDIO OPTUNA
+# PUNTO DE ENTRADA
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     if STATIC_MODE:
         print(f"⚙️  MODO ESTÁTICO | d_model={STATIC_D_MODEL} | d_state={STATIC_D_STATE} | lr={STATIC_LR:.2e} | lambda_cl={STATIC_LAMBDA_CL:.2f} | temp={STATIC_TEMP:.2f}")
         train_static()
-    else:
-        n_trials_to_run = N_TRIALS if N_TRIALS > 0 else (2 if TEST_MODE else 15)
+
+    elif USE_SWEEP:
+        n_trials = N_TRIALS if N_TRIALS > 0 else (2 if TEST_MODE else 15)
 
         if TEST_MODE:
-            print(f"⚠️  MODO PRUEBA: {n_trials_to_run} trials, 2 epochs, hiperparámetros fijos")
+            sweep_parameters = {
+                "d_model":   {"value": 128},
+                "d_state":   {"value": 16},
+                "lambda_cl": {"value": 0.5},
+                "lr":        {"value": 1e-3},
+                "temp":      {"value": 0.07},
+            }
+        else:
+            sweep_parameters = {
+                "d_model":   {"values": [128, 256, 512]},
+                "d_state":   {"values": [16, 32, 48, 64]},
+                "lambda_cl": {"distribution": "uniform",            "min": 0.1,  "max": 0.8},
+                "lr":        {"distribution": "log_uniform_values", "min": 1e-4, "max": 1e-3},
+                "temp":      {"distribution": "uniform",            "min": 0.05, "max": 0.15},
+            }
 
-        print(f"🔬 Iniciando estudio con {len(train_groups)} grupos de entrenamiento...")
+        sweep_config = {
+            "method": "bayes",
+            "metric": {
+                "name": "val_cl_loss"      if task == "contrastive" else "val_recall_macro",
+                "goal": "minimize"         if task == "contrastive" else "maximize",
+            },
+            "parameters": sweep_parameters,
+            "early_terminate": {"type": "hyperband", "min_iter": 2, "eta": 2},
+        }
+
+        project_name = f"{WANDB_PROJECT}-{EXP}-{task}-{USAR_BALANCE}"
+        print(f"🔬 Iniciando W&B Sweep (bayes) | {n_trials} trials | proyecto: {project_name}")
+
+        sweep_id = wandb.sweep(sweep_config, project=project_name)
+        wandb.agent(sweep_id, function=train_one_trial, count=n_trials)
+
+    else:
+        n_trials = N_TRIALS if N_TRIALS > 0 else (2 if TEST_MODE else 15)
+
+        if TEST_MODE:
+            print(f"⚠️  MODO PRUEBA: {n_trials} trials, 2 epochs, hiperparámetros fijos")
+
+        print(f"🔬 Iniciando Optuna | {n_trials} trials | {len(train_groups)} grupos de entrenamiento...")
 
         study = optuna.create_study(
             direction="maximize",
-            pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=1)
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5)
         )
-        study.optimize(objective, n_trials=n_trials_to_run)
+        study.optimize(objective, n_trials=n_trials)
 
         print("-" * 80)
         print(f"🏆 MEJORES PARÁMETROS: {study.best_params}")
-        print(f"📈 MEJOR F1 GLOBAL: {study.best_value:.4f}")
+        print(f"📈 MEJOR SCORE GLOBAL: {study.best_value:.4f}")

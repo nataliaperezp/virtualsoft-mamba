@@ -38,18 +38,19 @@ EXPERIMENTS = [
 # ---------------------------------------------------------------------------
 # CONFIGURACIÓN GCP
 # ---------------------------------------------------------------------------
-WORKERS = 2
-BATCH_GROUP_SIZE = 1000
+WORKERS = 10
+BATCH_GROUP_SIZE = 25
 BATCH_SIZE = 512
+EPOCHS = 30
 ESTADO= "Estático"
 PROJECT_ID    = "composed-arch-276322"
 REGION        = "us-east1"
-IMAGE         = f"gcr.io/{PROJECT_ID}/mamba-trainer-contrastive:v2"
+IMAGE         = f"gcr.io/{PROJECT_ID}/mamba-trainer-contrastive:v3"
 MACHINE_TYPE  = "g2-standard-16"
 ACCELERATOR   = "NVIDIA_L4"
-OUT_DIR       = "gs://ml-bucketvs/mamba-exp/data/sequences_output"
-CKPT_DIR      = f"gs://ml-bucketvs/mamba-exp/checkpoints/NVIDIA_L4_gs{BATCH_GROUP_SIZE}_w{WORKERS}_bs{BATCH_SIZE}_region_{REGION}_{ESTADO}"
-WANDB_PROJECT = f"mamba-train-{BATCH_GROUP_SIZE}-w{WORKERS }_bs{BATCH_SIZE}_region_{REGION}_{ESTADO}"
+OUT_DIR       = "gs://ml-bucketvs/mamba-exp/data/sequences_output_v3"
+CKPT_DIR      = f"gs://ml-bucketvs/mamba-exp/checkpoints/{ACCELERATOR}_gs{BATCH_GROUP_SIZE}_w{WORKERS}_bs{BATCH_SIZE}_region_{REGION}_{EPOCHS}_{ESTADO}"
+WANDB_PROJECT = f"mamba-train-{BATCH_GROUP_SIZE}-w{WORKERS }_bs{BATCH_SIZE}_region_{REGION}_{EPOCHS}_{ESTADO}"
 UIDS_PATH     = "/app/split_estratificado_uids.json"
 WANDB_API_KEY = os.environ.get(
     "WANDB_API_KEY",

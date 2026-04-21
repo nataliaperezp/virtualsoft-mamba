@@ -1,0 +1,51 @@
+FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 \
+        python3.11-dev \
+        curl \
+        git \
+        build-essential \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/*
+ENV TZ=UTC
+
+RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+ && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+ && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
+ && ln -sf /usr/local/bin/pip3 /usr/local/bin/pip
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ENV UV_SYSTEM_PYTHON=1 \
+    UV_NO_CACHE=1
+
+RUN uv pip install --system torch==2.4.0 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+RUN python3.11 -m pip install --no-cache-dir packaging ninja setuptools wheel
+
+ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0" \
+    MAMBA_FORCE_BUILD=TRUE \
+    CAUSAL_CONV1D_FORCE_BUILD=TRUE
+
+RUN python3.11 -m pip install --no-cache-dir --no-build-isolation \
+    git+https://github.com/Dao-AILab/causal-conv1d.git@v1.4.0 \
+    git+https://github.com/state-spaces/mamba.git@v2.2.2
+
+RUN uv pip install --system \
+    tzdata \
+    "transformers>=4.35,<5.0" \
+    polars==1.39.3 \
+    numpy==2.2.6 \
+    scikit-learn==1.7.2 \
+    pyarrow==23.0.1 \
+    wandb==0.25.1 \
+    optuna==4.8.0 \
+    gcsfs==2026.1.0 \
+    fsspec==2026.1.0 \
+    google-cloud-storage==3.10.1 \
+    psutil==5.9.3 \
+    tqdm==4.67.3 \
+    python-dotenv==1.2.2 \
+    plotly==5.24.1

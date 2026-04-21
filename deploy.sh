@@ -7,7 +7,7 @@
 
 PROJECT_ID="composed-arch-276322"
 REGION="us-central1"
-IMAGE="gcr.io/${PROJECT_ID}/mamba-trainer-contrastive:v1"        
+IMAGE="gcr.io/${PROJECT_ID}/mamba-trainer-contrastive:v3"        
 
 # echo "=============================================="
 # echo "  Desplegando Mamba Training Job en Vertex AI"

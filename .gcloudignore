@@ -49,3 +49,5 @@ wandb/
 mlruns/
 logs/
 *.log
+
+!model_arch.py
