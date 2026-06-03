@@ -10,6 +10,10 @@ COPY Mamba.py .
 COPY model_arch.py .
 COPY eval_contrastive_clusters.py .
 COPY split_estratificado_uids.json .
+COPY postgres_apipythondb_producto.csv .
 COPY .env .
 
-CMD ["python", "Mamba.py"]
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
+CMD ["./entrypoint.sh"]

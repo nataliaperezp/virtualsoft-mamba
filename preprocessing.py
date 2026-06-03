@@ -21,7 +21,7 @@ storage_client = storage.Client(project=PROJECT_ID)
 bucket = storage_client.bucket(BUCKET_NAME)
 
 
-def process_batch_all_history(events_lf, batch_ids, batch_idx, m_val, s_val, N_WINDOW, STRIDE, OUT_DIR_GCS,
+def process_batch_all_history(events_lf, batch_ids, batch_idx, m_val, s_val, N_WINDOW, STRIDE, OUT_DIR,
                               MIN_EVENTS=None, MAX_WINDOWS=None, STRIDE_THRESHOLD=3_000):
     start_time = time.perf_counter()
 
@@ -30,11 +30,11 @@ def process_batch_all_history(events_lf, batch_ids, batch_idx, m_val, s_val, N_W
         events_lf
         .filter(pl.col("USER_ID").is_in(batch_ids))
         .select([
-            pl.col("USER_ID").cast(pl.Int64),
+            pl.col("USER_ID").cast(pl.Int32),
             pl.col("TIMESTAMP_EVENT"),
             pl.col("VALUE").cast(pl.Float32),
             pl.col("EVENT_TYPE").cast(pl.Int8),
-            pl.col("PRODUCT_ID").cast(pl.Int64).fill_null(0)
+            pl.col("PRODUCT_ID").cast(pl.Int32).fill_null(0)
         ])
         .sort(["USER_ID", "TIMESTAMP_EVENT"])
         .with_columns([
@@ -107,17 +107,13 @@ def process_batch_all_history(events_lf, batch_ids, batch_idx, m_val, s_val, N_W
     if skipped_users:
         print(f"   ⚠️  {skipped_users} usuarios saltados por tener menos de {MIN_EVENTS} eventos")
 
-    # 5. Guardado DIRECTO AL BUCKET (Buffer en RAM)
+    # 5. Guardado a disco local
     if final_rows:
-        blob_name = f"{OUT_DIR_GCS}/batch_{batch_idx}_all_history.parquet"
-        blob = bucket.blob(blob_name)
-
-        buffer = io.BytesIO()
-        pl.DataFrame(final_rows).write_parquet(buffer, compression="zstd")
-        blob.upload_from_string(buffer.getvalue(), content_type="application/octet-stream")
-        buffer.close()
+        out_path = os.path.join(OUT_DIR, f"batch_{batch_idx}_all_history.parquet")
+        pl.DataFrame(final_rows).write_parquet(out_path, compression="zstd")
 
     duration = time.perf_counter() - start_time
+    print(f"✅ Batch {batch_idx} | {len(batch_ids)} users | {duration:.2f}s")
     del df_agg, final_rows
     gc.collect()
     return duration

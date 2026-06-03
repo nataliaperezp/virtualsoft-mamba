@@ -124,15 +124,14 @@ else:
 # STREAMING DATASET CON BUCKET BATCHING
 # ---------------------------------------------------------------------------
 class StreamingBucketDataset(IterableDataset):
-    def __init__(self, file_paths, uids_to_keep, max_seq_len, batch_size, use_balance, chunking=True, overlap=512):
+    def __init__(self, file_paths, uids_to_keep, max_seq_len, batch_size, use_balance, chunking=True):
         self.file_paths = file_paths
-        self.uids_to_keep = set(uids_to_keep) if uids_to_keep is not None else None
+        self.uids_to_keep = uids_to_keep
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size
         self.bucket_size = batch_size * 3  # Reducido para evitar OOM en g2-standard-16 (64GB RAM)
         self.use_balance = use_balance
         self.chunking = chunking  # True=training (múltiples chunks), False=val (truncar al último)
-        self.overlap = overlap
         
         # Usar el mapa calculado globalmente
         self.product_map = product_id_map
@@ -197,24 +196,21 @@ class StreamingBucketDataset(IterableDataset):
                                     p_seq = p_seq[-self.max_seq_len:]
                                     nf_seq = nf_seq[-self.max_seq_len:]
                                     t_seq = t_seq[-self.max_seq_len:]
-                                chunks = [(e_seq, p_seq, nf_seq, t_seq, 0)]
+                                chunks = [(e_seq, p_seq, nf_seq, t_seq)]
                             else:
                                 chunks = []
-                                stride = max(1, self.max_seq_len - self.overlap)
-                                for start in range(0, seq_len, stride):
+                                for start in range(0, seq_len, self.max_seq_len):
                                     end = min(start + self.max_seq_len, seq_len)
                                     if end - start < 2:  # chunk demasiado corto, saltar
                                         continue
-                                    warmup_len = self.overlap if start > 0 else 0
                                     chunks.append((
                                         e_seq[start:end],
                                         p_seq[start:end],
                                         nf_seq[start:end],
                                         t_seq[start:end],
-                                        warmup_len
                                     ))
 
-                            for c_e, c_p, c_nf, c_t, c_w in chunks:
+                            for c_e, c_p, c_nf, c_t in chunks:
                                 # Mapeo de productos
                                 if self.product_map:
                                     p_safe = [self.product_map.get(p, 0) for p in c_p]
@@ -228,8 +224,7 @@ class StreamingBucketDataset(IterableDataset):
                                     "event_type": torch.tensor(c_e, dtype=torch.long),
                                     "product_id": torch.tensor(p_safe, dtype=torch.long),
                                     "num_feats": torch.tensor(nf_proc, dtype=torch.float32),
-                                    "target": torch.tensor(c_t, dtype=torch.long),
-                                    "warmup_len": c_w
+                                    "target": torch.tensor(c_t, dtype=torch.long)
                                 })
                             
                             # Cuando el bucket se llena, ordena por longitud y genera batches (Smart Batching)
@@ -262,7 +257,6 @@ class StreamingBucketDataset(IterableDataset):
         for key in keys:
             sequences = [item[key] for item in batch]
             output[key] = pad_sequence(sequences, batch_first=True, padding_value=0)
-        output["warmup_len"] = torch.tensor([item["warmup_len"] for item in batch], dtype=torch.long)
         return output
 
 # ---------------------------------------------------------------------------
@@ -375,12 +369,6 @@ def main():
             pid = batch["product_id"].to(device)
             nf = batch["num_feats"].to(device)
             target = batch["target"].to(device)
-            warmup_len = batch["warmup_len"].to(device)
-            
-            # Enmascarar tokens de warmup para no calcular loss sobre ellos
-            for i, w in enumerate(warmup_len):
-                if w > 0:
-                    target[i, :w] = 0
             
             with torch.cuda.amp.autocast():
                 logits = model(et, pid, nf)
@@ -422,7 +410,7 @@ def main():
         val_loader = DataLoader(val_ds, batch_size=None, num_workers=min(NUM_WORKERS, 2), prefetch_factor=2)
         
         # Matriz de confusión incremental — memoria constante O(n_classes²)
-        n_classes = 22  # 0 (pad) + 21 event types
+        n_classes = 21  # número de event types
         confusion = np.zeros((n_classes, n_classes), dtype=np.int64)
         
         with torch.no_grad():
@@ -431,12 +419,6 @@ def main():
                 pid = batch["product_id"].to(device)
                 nf = batch["num_feats"].to(device)
                 target = batch["target"].to(device)
-                warmup_len = batch["warmup_len"].to(device)
-                
-                # Enmascarar tokens de warmup
-                for i, w in enumerate(warmup_len):
-                    if w > 0:
-                        target[i, :w] = 0
                 
                 with torch.cuda.amp.autocast():
                     logits = model(et, pid, nf)

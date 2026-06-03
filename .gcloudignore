@@ -51,3 +51,4 @@ logs/
 *.log
 
 !model_arch.py
+!postgres_apipythondb_producto.csv

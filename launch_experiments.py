@@ -38,19 +38,28 @@ EXPERIMENTS = [
 # ---------------------------------------------------------------------------
 # CONFIGURACIÓN GCP
 # ---------------------------------------------------------------------------
-WORKERS = 10
-BATCH_GROUP_SIZE = 25
-BATCH_SIZE = 512
-EPOCHS = 30
-ESTADO= "Estático"
+ESTADO        = "MambaModel_Ecuabet_Total"
 PROJECT_ID    = "composed-arch-276322"
-REGION        = "us-east1"
-IMAGE         = f"gcr.io/{PROJECT_ID}/mamba-trainer-contrastive:v3"
-MACHINE_TYPE  = "g2-standard-16"
-ACCELERATOR   = "NVIDIA_L4"
-OUT_DIR       = "gs://ml-bucketvs/mamba-exp/data/sequences_output_v3"
-CKPT_DIR      = f"gs://ml-bucketvs/mamba-exp/checkpoints/{ACCELERATOR}_gs{BATCH_GROUP_SIZE}_w{WORKERS}_bs{BATCH_SIZE}_region_{REGION}_{EPOCHS}_{ESTADO}"
-WANDB_PROJECT = f"mamba-train-{BATCH_GROUP_SIZE}-w{WORKERS }_bs{BATCH_SIZE}_region_{REGION}_{EPOCHS}_{ESTADO}"
+DEFAULT_REGION = "us-east1"
+IMAGE         = f"gcr.io/{PROJECT_ID}/mamba-trainer:v5"
+OUT_DIR       = "gs://ml-bucketvs/mamba-exp/data/Ecuabet_Procesado_Final/batch_*.parquet"
+
+# Perfiles de máquinas preconfigurados
+MACHINE_PROFILES = {
+    "g16":  {"machine_type": "g2-standard-16",      "accelerator": "nvidia-l4",        "num_gpus": 1, "default_workers": 2,  "desc": "1x L4 (24GB VRAM, 64GB RAM)"},
+    "g24":  {"machine_type": "g2-standard-24",      "accelerator": "nvidia-l4",        "num_gpus": 2, "default_workers": 4,  "desc": "2x L4 (48GB VRAM, 96GB RAM)"},
+    "g48":  {"machine_type": "g2-standard-48",      "accelerator": "nvidia-l4",        "num_gpus": 4, "default_workers": 8,  "desc": "4x L4 (96GB VRAM, 192GB RAM)"},
+    "a100": {"machine_type": "a2-highgpu-1g",       "accelerator": "nvidia-tesla-a100", "num_gpus": 1, "default_workers": 4,  "desc": "1x A100 (40GB VRAM, 85GB RAM)"},
+}
+DEFAULT_MACHINE = "g16"
+
+def get_ckpt_base(accelerator, machine_type):
+    return f"gs://ml-bucketvs/mamba-exp/checkpoints/{ESTADO}/{accelerator}-{machine_type}"
+
+# Directorio base de checkpoints — se especializa por experimento dentro de build_job_yaml
+GCS_CKPT_BASE  = get_ckpt_base(MACHINE_PROFILES[DEFAULT_MACHINE]["accelerator"], MACHINE_PROFILES[DEFAULT_MACHINE]["machine_type"])
+# Prefijo base de W&B — se especializa por experimento dentro de build_job_yaml
+WANDB_BASE     = f"{ESTADO}"
 UIDS_PATH     = "/app/split_estratificado_uids.json"
 WANDB_API_KEY = os.environ.get(
     "WANDB_API_KEY",
@@ -69,29 +78,43 @@ def print_grid():
     print("└────┴─────────────────┴───────────────┴─────────────────────┘\n")
 
 
-def build_job_yaml(exp: dict, test_mode: bool = False, test_files: int = 10,
+def build_job_yaml(exp: dict, timestamp: str = "", test_mode: bool = False, test_files: int = 10,
                    group_size: int = 0, n_epochs: int = 0,
                    batch_size: int = 0, num_workers: int = 0,
+                   grad_accum_steps: int = 0, max_seq_len: int = 0,
                    n_trials: int = 0,
                    static_mode: bool = False, d_model: int = 256, d_state: int = 64,
-                   lr: float = 5e-4, lambda_cl: float = 0.5, temp: float = 0.1) -> str:
+                   lr: float = 5e-4, lambda_cl: float = 0.5, temp: float = 0.1,
+                   machine_profile: dict = None) -> str:
     """Genera el contenido YAML del job para --config."""
-    test_suffix = "-test" if test_mode else ""
-    static_suffix = "-static" if static_mode else ""
-    balance_val = "True" if exp["usar_balance"] else "False"
-    ckpt_dir    = f"{CKPT_DIR}/exp{exp['id']}{test_suffix}{static_suffix}"
+    profile = machine_profile or MACHINE_PROFILES[DEFAULT_MACHINE]
+    m_type  = profile["machine_type"]
+    n_gpus  = profile["num_gpus"]
+    accel   = profile["accelerator"]
+    
+    test_suffix   = "-t" if test_mode   else ""
+    static_suffix = "s"  if static_mode else "o"  # s=static, o=optuna
+    balance_val   = "True" if exp["usar_balance"] else "False"
+
+    # Slug corto: el ID ya codifica task+balance, el sufijo indica modo
+    exp_slug      = f"e{exp['id']}-{static_suffix}{test_suffix}"
+    slug_with_ts  = f"{exp_slug}-{timestamp}" if timestamp else exp_slug
+    ckpt_dir      = f"{get_ckpt_base(accel, m_type)}/{slug_with_ts}"
+    wandb_project = f"{WANDB_BASE}-{exp_slug}"
 
     # Resolver defaults aquí para que el YAML sea siempre explícito y auditable
     resolved_epochs      = n_epochs     if n_epochs     > 0 else (2   if test_mode else 10)
-    resolved_batch_size  = batch_size   if batch_size   > 0 else (64  if test_mode else 512)
+    resolved_batch_size  = batch_size   if batch_size   > 0 else (16  if test_mode else 64)
     resolved_group_size  = group_size   if group_size   > 0 else (2   if test_mode else 100)
-    resolved_num_workers = num_workers  if num_workers  > 0 else 6
+    resolved_num_workers = num_workers  if num_workers  > 0 else profile["default_workers"]
     resolved_trials      = n_trials     if n_trials     > 0 else (2   if test_mode else 15)
+    resolved_grad_accum  = grad_accum_steps if grad_accum_steps > 0 else (1 if test_mode else 8)
+    resolved_max_seq     = max_seq_len if max_seq_len > 0 else 2048
 
     env_vars = [
         {"name": "OUT_DIR",                    "value": OUT_DIR},
         {"name": "GCS_CKPT_DIR",               "value": ckpt_dir},
-        {"name": "WANDB_PROJECT",              "value": WANDB_PROJECT},
+        {"name": "WANDB_PROJECT",              "value": wandb_project},
         {"name": "UIDS_PATH",                  "value": UIDS_PATH},
         {"name": "WANDB_API_KEY",              "value": WANDB_API_KEY},
         {"name": "EXP",                        "value": str(exp["id"])},
@@ -102,6 +125,9 @@ def build_job_yaml(exp: dict, test_mode: bool = False, test_files: int = 10,
         {"name": "BATCH_SIZE",                 "value": str(resolved_batch_size)},
         {"name": "GROUP_SIZE",                 "value": str(resolved_group_size)},
         {"name": "NUM_WORKERS",                "value": str(resolved_num_workers)},
+        {"name": "GRAD_ACCUM_STEPS",             "value": str(resolved_grad_accum)},
+        {"name": "MAX_SEQ_LEN",                  "value": str(resolved_max_seq)},
+        {"name": "NUM_GPUS",                     "value": str(n_gpus)},
     ]
 
     if static_mode:
@@ -128,9 +154,9 @@ def build_job_yaml(exp: dict, test_mode: bool = False, test_files: int = 10,
     return (
         "workerPoolSpecs:\n"
         "- machineSpec:\n"
-        f"    machineType: {MACHINE_TYPE}\n"
-        f"    acceleratorType: {ACCELERATOR}\n"
-        "    acceleratorCount: 1\n"
+        f"    machineType: {m_type}\n"
+        f"    acceleratorType: {accel}\n"
+        f"    acceleratorCount: {n_gpus}\n"
         "  replicaCount: 1\n"
         "  containerSpec:\n"
         f"    imageUri: {IMAGE}\n"
@@ -140,26 +166,36 @@ def build_job_yaml(exp: dict, test_mode: bool = False, test_files: int = 10,
 
 def launch_experiment(exp: dict, dry_run: bool = False, test_mode: bool = False,
                       test_files: int = 10, group_size: int = 0, n_epochs: int = 0,
-                      batch_size: int = 0, num_workers: int = 0, n_trials: int = 0,
+                      batch_size: int = 0, num_workers: int = 0, grad_accum_steps: int = 0,
+                      max_seq_len: int = 0, n_trials: int = 0,
                       static_mode: bool = False, d_model: int = 256, d_state: int = 64,
-                      lr: float = 5e-4, lambda_cl: float = 0.5, temp: float = 0.1):
-    timestamp    = datetime.now().strftime("%Y%m%d-%H%M")
-    test_suffix  = "-test" if test_mode else ""
-    static_suffix = "-static" if static_mode else ""
-    bs_tag       = f"bs{batch_size}" if batch_size > 0 else "bs512"
-    machine_tag  = MACHINE_TYPE.replace("-", "").replace("standard", "s")  # g2s16
-    job_name     = f"mamba-exp{exp['id']}-{exp['task']}{test_suffix}{static_suffix}-{bs_tag}-{machine_tag}-{timestamp}"
+                      lr: float = 5e-4, lambda_cl: float = 0.5, temp: float = 0.1,
+                      run_group: str = None, machine_profile: dict = None, region: str = None):
+    timestamp     = datetime.now().strftime("%m%d-%H%M")
+    test_suffix   = "-t"  if test_mode   else ""
+    static_suffix = "s"   if static_mode else "o"
+    exp_slug      = f"e{exp['id']}-{static_suffix}{test_suffix}"
+
+    # job_name para Vertex AI (display name)
+    job_name   = f"mamba-{ESTADO.lower()}-{exp_slug}-{timestamp}"
+
+    # label auto-generado por experimento; --run-group es prefijo opcional para agrupar runs
+    auto_label = f"{ESTADO.lower()}-{exp_slug}"
+    label_val  = f"{run_group.lower()}-{auto_label}" if run_group else auto_label
+
     balance_str = "con balance" if exp["usar_balance"] else "sin balance"
 
-    yaml_content = build_job_yaml(exp, test_mode=test_mode, test_files=test_files,
+    yaml_content = build_job_yaml(exp, timestamp=timestamp, test_mode=test_mode, test_files=test_files,
                                   group_size=group_size, n_epochs=n_epochs,
                                   batch_size=batch_size, num_workers=num_workers,
+                                  grad_accum_steps=grad_accum_steps, max_seq_len=max_seq_len,
                                   n_trials=n_trials, static_mode=static_mode,
                                   d_model=d_model, d_state=d_state,
-                                  lr=lr, lambda_cl=lambda_cl, temp=temp)
+                                  lr=lr, lambda_cl=lambda_cl, temp=temp,
+                                  machine_profile=machine_profile)
 
     print(f"\n🚀 Lanzando Experimento {exp['id']}: {exp['task']} {balance_str}")
-    print(f"   Descripción: {exp['desc']}")
+    print(f"   Job: {job_name} | Label: {label_val}")
 
     if dry_run:
         print(f"   [DRY-RUN] YAML que se usaría (--display-name={job_name}):")
@@ -172,13 +208,16 @@ def launch_experiment(exp: dict, dry_run: bool = False, test_mode: bool = False,
         tmp_path = f.name
 
     try:
+        run_label = f"m{exp['id']}-{ESTADO.lower().replace('_', '-')}-{timestamp.replace('-', '')}-{exp['id']}"
+        labels_str = f"model=mamba-training,run_label={run_label},proyecto=sistema-de-recomendacion-dev"
+
         cmd = [
             "gcloud", "ai", "custom-jobs", "create",
-            f"--region={REGION}",
+            f"--region={region or DEFAULT_REGION}",
             f"--display-name={job_name}",
             f"--project={PROJECT_ID}",
             f"--config={tmp_path}",
-            "--labels=model=mamba-training",
+            f"--labels={labels_str}",
         ]
         result = subprocess.run(cmd, capture_output=False, text=True)
         if result.returncode == 0:
@@ -232,7 +271,12 @@ def main():
     )
     parser.add_argument("--list",       action="store_true", help="Lista el grid de experimentos y sale")
     parser.add_argument("--run",        type=str, default=None, help="IDs a lanzar (ej: 1,3,5 o 'all')")
+    parser.add_argument("--run-group",  type=str, default=None, help="Prefijo opcional para agrupar este lanzamiento (ej: 'v2-ablation'). El label final se auto-genera por experimento.")
     parser.add_argument("--dry-run",    action="store_true", help="Muestra el YAML sin ejecutar")
+    parser.add_argument("--machine",    type=str, default=DEFAULT_MACHINE, choices=MACHINE_PROFILES.keys(),
+                        help=f"Perfil de máquina (default: {DEFAULT_MACHINE}). Opciones: " + ", ".join(f"{k}={v['desc']}" for k,v in MACHINE_PROFILES.items()))
+    parser.add_argument("--region",     type=str, default=DEFAULT_REGION,
+                        help=f"Región GCP (default: {DEFAULT_REGION})")
     parser.add_argument("--test",        action="store_true", help="Modo prueba: pocos datos, 2 trials, 2 epochs")
     parser.add_argument("--test-files",  type=int, default=10,
                         help="Nro. de archivos parquet en modo prueba (default: 10 ≈ 1000 usuarios)")
@@ -241,9 +285,13 @@ def main():
     parser.add_argument("--epochs",       type=int, default=0,
                         help="Épocas de entrenamiento (default: 2 prueba / 10 prod)")
     parser.add_argument("--batch-size",   type=int, default=0,
-                        help="Batch size (default: 64 prueba / 512 prod)")
+                        help="Micro-batch size por paso de GPU (default: 16 prueba / 64 prod)")
+    parser.add_argument("--grad-accum",   type=int, default=0,
+                        help="Pasos de gradient accumulation (effective_batch = batch_size * grad_accum, default: 1 prueba / 8 prod)")
     parser.add_argument("--num-workers",  type=int, default=0,
-                        help="Workers del DataLoader (default: 6)")
+                        help="Workers del DataLoader (default: 2)")
+    parser.add_argument("--max-seq-len",  type=int, default=0,
+                        help="Longitud máxima de secuencia (default: 2048)")
     parser.add_argument("--trials",       type=int, default=0,
                         help="Trials de Optuna (default: 2 prueba / 15 prod)")
     # Modo estático
@@ -276,21 +324,29 @@ def main():
     dry_label  = " [DRY-RUN]"   if args.dry_run else ""
     test_label = " [TEST MODE]" if args.test    else ""
 
-    print(f"\n📋 Se lanzarán {len(selected_exps)} experimento(s){dry_label}{test_label}:")
+    # Aplicar perfil de máquina
+    profile = MACHINE_PROFILES[args.machine]
+    resolved_region = args.region
+
+    print(f"\n🖥️  Máquina: {profile['machine_type']} ({profile['desc']}) | Región: {resolved_region}")
+    print(f"📋 Se lanzarán {len(selected_exps)} experimento(s){dry_label}{test_label}:")
     for exp in selected_exps:
         balance_str = "con balance" if exp["usar_balance"] else "sin balance"
         print(f"   • Exp {exp['id']}: {exp['task']} {balance_str} — {exp['desc']}")
 
     test_mode = args.test
     eff_epochs      = args.epochs     if args.epochs     > 0 else (2   if test_mode else 10)
-    eff_batch_size  = args.batch_size if args.batch_size > 0 else (64  if test_mode else 512)
+    eff_batch_size  = args.batch_size if args.batch_size > 0 else (16  if test_mode else 64)
     eff_group_size  = args.group_size if args.group_size > 0 else (2   if test_mode else 100)
     eff_trials      = args.trials     if args.trials     > 0 else (2   if test_mode else 15)
+    eff_grad_accum  = args.grad_accum if args.grad_accum > 0 else (1   if test_mode else 8)
+    eff_workers     = args.num_workers if args.num_workers > 0 else profile["default_workers"]
 
     if args.static:
-        print(f"\n   Config estática: d_model={args.d_model} | d_state={args.d_state} | lr={args.lr:.2e} | lambda_cl={args.lambda_cl:.2f} | temp={args.temp:.3f}", end="")
+        print(f"\n   Config estática: d_model={args.d_model} | d_state={args.d_state} | lr={args.lr:.2e} | lambda_cl={args.lambda_cl:.2f} | temp={args.temp:.3f}")
+        print(f"   Config efectiva: epochs={eff_epochs} | micro_batch={eff_batch_size} x grad_accum={eff_grad_accum} = eff_batch={eff_batch_size * eff_grad_accum} | workers={eff_workers}", end="")
     else:
-        print(f"\n   Config efectiva: epochs={eff_epochs} | batch_size={eff_batch_size} | group_size={eff_group_size} | trials={eff_trials}", end="")
+        print(f"\n   Config efectiva: epochs={eff_epochs} | micro_batch={eff_batch_size} x grad_accum={eff_grad_accum} = eff_batch={eff_batch_size * eff_grad_accum} | group_size={eff_group_size} | trials={eff_trials}", end="")
     if test_mode:
         print(f" | test_files={args.test_files} [PRUEBA]", end="")
     print()
@@ -305,10 +361,14 @@ def main():
         launch_experiment(exp, dry_run=args.dry_run, test_mode=args.test,
                           test_files=args.test_files, group_size=args.group_size,
                           n_epochs=args.epochs, batch_size=args.batch_size,
-                          num_workers=args.num_workers, n_trials=args.trials,
+                          num_workers=args.num_workers, grad_accum_steps=args.grad_accum,
+                          max_seq_len=args.max_seq_len,
+                          n_trials=args.trials,
                           static_mode=args.static, d_model=args.d_model,
                           d_state=args.d_state, lr=args.lr,
-                          lambda_cl=args.lambda_cl, temp=args.temp)
+                          lambda_cl=args.lambda_cl, temp=args.temp,
+                          run_group=args.run_group,
+                          machine_profile=profile, region=resolved_region)
 
     if not args.dry_run:
         print(f"\n✅ {len(selected_exps)} job(s) enviados a Vertex AI.")
