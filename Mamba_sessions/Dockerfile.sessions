@@ -1,0 +1,18 @@
+# =============================================================================
+# Dockerfile.sessions — imagen para Mamba_Sessions.py
+# Base: gcr.io/composed-arch-276322/mamba-base:v1 (dependencias compiladas)
+# Build: bash deploy_sessions.sh   |   Imagen: mamba-sessions:v1
+# =============================================================================
+FROM gcr.io/composed-arch-276322/mamba-base:v1
+
+WORKDIR /app
+COPY Mamba_sessions/Mamba_Sessions.py .
+COPY Mamba_sessions/model_arch_sessions.py .
+COPY split_estratificado_uids.json .
+COPY postgres_apipythondb_producto.csv .
+COPY .env .
+
+COPY Mamba_sessions/entrypoint_sessions.sh .
+RUN chmod +x entrypoint_sessions.sh
+
+CMD ["./entrypoint_sessions.sh"]

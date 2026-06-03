@@ -1,0 +1,24 @@
+# =============================================================================
+# cloudbuild.sessions.yaml — Build y push de la imagen mamba-sessions:v1
+# Ejecutar: gcloud builds submit --config=cloudbuild.sessions.yaml --project=composed-arch-276322 .
+# =============================================================================
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--platform=linux/amd64'
+      - '-f'
+      - 'Mamba_sessions/Dockerfile.sessions'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/mamba-sessions:v1'
+      - '.'
+    timeout: '600s'
+
+images:
+  - 'gcr.io/$PROJECT_ID/mamba-sessions:v1'
+
+timeout: '900s'
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
